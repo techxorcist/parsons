@@ -65,9 +65,15 @@ class Redshift(
             The default AWS secret access key for copying data from S3 into Redshift
             when running copy/upsert/etc methods.
             This will default to environment variable AWS_SECRET_ACCESS_KEY.
+        aws_session_token: str
+            AWS session token for temporary credentials. Optional.
+            This will default to environment variable AWS_SESSION_TOKEN if use_env_token is True.
         iam_role: str
-            AWS IAM Role ARN string -- an optional, different way for credentials to
-            be provided in the Redshift copy command that does not require an access key.
+            AWS IAM Role ARN string for Redshift service-side role assumption (deprecated).
+            Use role_arn for client-side assumption instead.
+        role_arn: str
+            AWS IAM Role ARN for client-side STS role assumption.
+            When provided, the role will be assumed using STS and temporary credentials will be used.
         use_env_token: bool
             Controls use of the ``AWS_SESSION_TOKEN`` environment variable for S3. Defaults
             to ``True``. Set to ``False`` in order to ignore the ``AWS_SESSION_TOKEN`` environment
@@ -85,9 +91,24 @@ class Redshift(
         s3_temp_bucket=None,
         aws_access_key_id=None,
         aws_secret_access_key=None,
+        aws_session_token=None,
         iam_role=None,
+        role_arn=None,
         use_env_token=True,
     ):
+        # Initialize RedshiftCopyTable mixin with all necessary parameters
+        RedshiftCopyTable.__init__(
+            self,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            s3_temp_bucket=s3_temp_bucket,
+            iam_role=iam_role,
+            role_arn=role_arn,
+            use_env_token=use_env_token,
+        )
+
+        # Initialize other parent classes
         super().__init__()
 
         try:
@@ -102,19 +123,27 @@ class Redshift(
 
         self.timeout = timeout
         self.dialect = "redshift"
-        self.s3_temp_bucket = s3_temp_bucket or os.environ.get("S3_TEMP_BUCKET")
-        # Set prefix for temp S3 bucket paths that include subfolders
-        self.s3_temp_bucket_prefix = None
-        if self.s3_temp_bucket and "/" in self.s3_temp_bucket:
-            split_temp_bucket_name = self.s3_temp_bucket.split("/", 1)
-            self.s3_temp_bucket = split_temp_bucket_name[0]
-            self.s3_temp_bucket_prefix = split_temp_bucket_name[1]
-        self.use_env_token = use_env_token
-        # We don't check/load the environment variables for aws_* here
-        # because the logic in S3() and rs_copy_table.py does already.
-        self.aws_access_key_id = aws_access_key_id
-        self.aws_secret_access_key = aws_secret_access_key
-        self.iam_role = iam_role
+
+        # Handle S3 temp bucket and prefix (override mixin property)
+        s3_temp_bucket_final = s3_temp_bucket or os.environ.get("S3_TEMP_BUCKET")
+        if s3_temp_bucket_final and "/" in s3_temp_bucket_final:
+            split_temp_bucket_name = s3_temp_bucket_final.split("/", 1)
+            self._s3_temp_bucket = split_temp_bucket_name[0]
+            self._s3_temp_bucket_prefix = split_temp_bucket_name[1]
+        else:
+            self._s3_temp_bucket = s3_temp_bucket_final
+            self._s3_temp_bucket_prefix = None
+
+        # Store AWS credentials - override mixin values if provided
+        # Use private attributes to work with the mixin's property system
+        if aws_access_key_id is not None:
+            self._aws_access_key_id = aws_access_key_id
+        if aws_secret_access_key is not None:
+            self._aws_secret_access_key = aws_secret_access_key
+        if iam_role is not None:
+            self._iam_role = iam_role
+        if role_arn is not None:
+            self._role_arn = role_arn
 
     @contextmanager
     def connection(self):

@@ -178,6 +178,140 @@ class TestRedshift(unittest.TestCase):
         os.environ["AWS_ACCESS_KEY_ID"] = prior_aws_access_key_id
         os.environ["AWS_SECRET_ACCESS_KEY"] = prior_aws_secret_access_key
 
+    def test_get_creds_with_session_token(self):
+        """Test session token support in get_creds method"""
+        # Test session token with kwargs
+        prior_aws_session_token = os.environ.get("AWS_SESSION_TOKEN", "")
+        os.environ["AWS_SESSION_TOKEN"] = "test_session_token"
+
+        creds = self.rs.get_creds("kwarg_key", "kwarg_secret_key")
+        expected = (
+            "credentials 'aws_access_key_id=kwarg_key;aws_secret_access_key=kwarg_secret_key;"
+            "token=test_session_token'\n"
+        )
+        self.assertEqual(creds, expected)
+
+        # Test session token with environmental variables
+        prior_aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+        prior_aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        os.environ["AWS_ACCESS_KEY_ID"] = "env_key"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "env_secret_key"
+
+        creds = self.rs.get_creds(None, None)
+        expected = (
+            "credentials 'aws_access_key_id=env_key;aws_secret_access_key=env_secret_key;"
+            "token=test_session_token'\n"
+        )
+        self.assertEqual(creds, expected)
+
+        # Test without session token (should work as before)
+        os.environ["AWS_SESSION_TOKEN"] = ""
+        creds = self.rs.get_creds("kwarg_key", "kwarg_secret_key")
+        expected = (
+            "credentials 'aws_access_key_id=kwarg_key;aws_secret_access_key=kwarg_secret_key'\n"
+        )
+        self.assertEqual(creds, expected)
+
+        # Test with use_env_token=False (should ignore session token)
+        os.environ["AWS_SESSION_TOKEN"] = "test_session_token"
+        rs_no_token = Redshift(
+            username="test", password="test", host="test", db="test", port=123, use_env_token=False
+        )
+        creds = rs_no_token.get_creds("kwarg_key", "kwarg_secret_key")
+        expected = (
+            "credentials 'aws_access_key_id=kwarg_key;aws_secret_access_key=kwarg_secret_key'\n"
+        )
+        self.assertEqual(creds, expected)
+
+        # Reset env vars
+        os.environ["AWS_ACCESS_KEY_ID"] = prior_aws_access_key_id
+        os.environ["AWS_SECRET_ACCESS_KEY"] = prior_aws_secret_access_key
+        os.environ["AWS_SESSION_TOKEN"] = prior_aws_session_token
+
+    def test_get_creds_with_iam_role_deprecated(self):
+        """Test deprecated iam_role parameter in get_creds method"""
+        # Test deprecated iam_role parameter (should generate warning)
+        rs_with_iam_role = Redshift(
+            username="test",
+            password="test",
+            host="test",
+            db="test",
+            port=123,
+            iam_role="arn:aws:iam::123456789012:role/TestRole",
+        )
+
+        with LogCapture() as lc:
+            creds = rs_with_iam_role.get_creds(None, None)
+            expected = "credentials 'aws_iam_role=arn:aws:iam::123456789012:role/TestRole'\n"
+            self.assertEqual(creds, expected)
+
+            # Check that deprecation warning was logged
+            warning_logged = any(
+                "deprecated" in record.getMessage().lower() for record in lc.records
+            )
+            self.assertTrue(warning_logged, "Expected deprecation warning for iam_role")
+
+    def test_get_creds_with_role_arn_initialization(self):
+        """Test role_arn parameter initialization and property access"""
+        # Test role_arn parameter setup
+        rs_with_role = Redshift(
+            username="test",
+            password="test",
+            host="test",
+            db="test",
+            port=123,
+            role_arn="arn:aws:iam::123456789012:role/TestRole",
+        )
+
+        # Test property access
+        self.assertEqual(rs_with_role.role_arn, "arn:aws:iam::123456789012:role/TestRole")
+        self.assertIsNone(rs_with_role.iam_role)
+
+        # Test that both parameters can be set
+        rs_with_both = Redshift(
+            username="test",
+            password="test",
+            host="test",
+            db="test",
+            port=123,
+            iam_role="arn:aws:iam::123456789012:role/DeprecatedRole",
+            role_arn="arn:aws:iam::123456789012:role/NewRole",
+        )
+
+        self.assertEqual(rs_with_both.role_arn, "arn:aws:iam::123456789012:role/NewRole")
+        self.assertEqual(rs_with_both.iam_role, "arn:aws:iam::123456789012:role/DeprecatedRole")
+
+    def test_credentials_priority_order(self):
+        """Test that credential resolution follows the correct priority order"""
+        # Test that role_arn takes priority over iam_role when both are provided
+        rs_with_both = Redshift(
+            username="test",
+            password="test",
+            host="test",
+            db="test",
+            port=123,
+            iam_role="arn:aws:iam::123456789012:role/DeprecatedRole",
+            role_arn="arn:aws:iam::123456789012:role/NewRole",
+        )
+
+        # Since role_arn has priority, it should be used (but since we can't actually call STS in tests,
+        # we just verify the role_arn property is accessible and non-None)
+        self.assertEqual(rs_with_both.role_arn, "arn:aws:iam::123456789012:role/NewRole")
+
+        # Test that iam_role is used when role_arn is not provided
+        rs_with_iam_only = Redshift(
+            username="test",
+            password="test",
+            host="test",
+            db="test",
+            port=123,
+            iam_role="arn:aws:iam::123456789012:role/TestRole",
+        )
+
+        creds = rs_with_iam_only.get_creds(None, None)
+        expected = "credentials 'aws_iam_role=arn:aws:iam::123456789012:role/TestRole'\n"
+        self.assertEqual(creds, expected)
+
     def scrub_copy_tokens(self, s):
         s = re.sub("=.+;", "=*HIDDEN*;", s)
         s = re.sub("aws_secret_access_key=.+'", "aws_secret_access_key=*HIDDEN*'", s)

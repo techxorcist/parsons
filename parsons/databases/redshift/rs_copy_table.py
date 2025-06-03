@@ -2,6 +2,9 @@ import logging
 import os
 import time
 
+import boto3
+from botocore.client import ClientError
+
 from parsons.aws.s3 import S3
 
 logger = logging.getLogger(__name__)
@@ -10,12 +13,175 @@ S3_TEMP_KEY_PREFIX = "Parsons_RedshiftCopyTable"
 
 
 class RedshiftCopyTable(object):
-    aws_access_key_id = None
-    aws_secret_access_key = None
-    iam_role = None
+    def __init__(
+        self,
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+        s3_temp_bucket=None,
+        iam_role=None,
+        role_arn=None,
+        use_env_token=True,
+    ):
+        """
+        Initialize RedshiftCopyTable with credential and configuration options.
 
-    def __init__(self, use_env_token=True):
+        `Args:`
+            aws_access_key_id: str
+                AWS access key ID. Optional if using environment variables or role assumption.
+            aws_secret_access_key: str
+                AWS secret access key. Optional if using environment variables or role assumption.
+            aws_session_token: str
+                AWS session token for temporary credentials. Optional.
+            s3_temp_bucket: str
+                S3 bucket for temporary file storage during copy operations.
+            iam_role: str
+                AWS IAM Role ARN for Redshift service-side role assumption (deprecated).
+                Use role_arn for client-side assumption instead.
+            role_arn: str
+                AWS IAM Role ARN for client-side STS role assumption.
+            use_env_token: bool
+                Whether to use AWS_SESSION_TOKEN environment variable. Defaults to True.
+        """
+        # Explicit credential parameters
+        self._aws_access_key_id = aws_access_key_id
+        self._aws_secret_access_key = aws_secret_access_key
+        self._aws_session_token = aws_session_token
+        self._s3_temp_bucket = s3_temp_bucket
+        self._iam_role = iam_role
+        self._role_arn = role_arn
         self.use_env_token = use_env_token
+
+        # Initialize cached credentials and STS client
+        self._assumed_credentials = None
+        self._sts_client = None
+
+    def _get_attribute_with_fallback(self, attr_name, private_attr_name=None):
+        """Get attribute from explicit value."""
+        private_attr_name = private_attr_name or f"_{attr_name}"
+        # Return the private attribute value, or None if not set
+        return getattr(self, private_attr_name, None)
+
+    @property
+    def aws_access_key_id(self):
+        """Get AWS access key ID from explicit value or parent class."""
+        return self._get_attribute_with_fallback("aws_access_key_id")
+
+    @property
+    def aws_secret_access_key(self):
+        """Get AWS secret access key from explicit value or parent class."""
+        return self._get_attribute_with_fallback("aws_secret_access_key")
+
+    @property
+    def iam_role(self):
+        """Get IAM role from explicit value or parent class (deprecated)."""
+        return self._get_attribute_with_fallback("iam_role")
+
+    @property
+    def role_arn(self):
+        """Get role ARN for STS assumption."""
+        return self._get_attribute_with_fallback("role_arn")
+
+    @property
+    def s3_temp_bucket(self):
+        """Get S3 temp bucket from explicit value or parent class."""
+        return self._get_attribute_with_fallback("s3_temp_bucket")
+
+    @property
+    def s3_temp_bucket_prefix(self):
+        """Get S3 temp bucket prefix from parent class if available."""
+        return self._get_attribute_with_fallback("s3_temp_bucket_prefix")
+
+    def assume_role(self, role_arn=None, session_name=None):
+        """
+        Assume an AWS IAM role using STS and cache the credentials.
+
+        `Args:`
+            role_arn: str
+                The ARN of the role to assume. If not provided, uses self.role_arn.
+            session_name: str
+                Optional session name for the assumed role session.
+
+        `Returns:`
+            dict
+                Dictionary containing temporary credentials (AccessKeyId, SecretAccessKey, SessionToken).
+        """
+        role_arn = role_arn or self.role_arn
+        if not role_arn:
+            raise ValueError("No role ARN provided for assumption")
+
+        # Create STS client if not exists
+        if not self._sts_client:
+            self._sts_client = boto3.client("sts")
+
+        # Generate session name if not provided
+        if not session_name:
+            session_name = f"parsons-redshift-{int(time.time())}"
+
+        try:
+            logger.debug(f"Assuming role: {role_arn}")
+            response = self._sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=session_name,
+                DurationSeconds=3600,  # 1 hour default
+            )
+
+            credentials = response["Credentials"]
+            self._assumed_credentials = {
+                "access_key": credentials["AccessKeyId"],
+                "secret_key": credentials["SecretAccessKey"],
+                "session_token": credentials["SessionToken"],
+                "expiration": credentials["Expiration"],
+            }
+
+            logger.debug("Role assumption successful")
+            return self._assumed_credentials
+
+        except ClientError as e:
+            error_message = f"""Failed to assume role {role_arn}
+            This may be due to insufficient permissions or incorrect role ARN.
+            Ensure the current credentials have sts:AssumeRole permission for this role."""
+            logger.error(error_message)
+            raise e
+
+    def _get_sts_credentials(self):
+        """Get credentials from STS role assumption."""
+        if not self._assumed_credentials:
+            self.assume_role()
+        return self._assumed_credentials
+
+    def _get_standard_credentials(self, aws_access_key_id, aws_secret_access_key):
+        """Get credentials using standard resolution (existing logic)."""
+        aws_session_token = None
+
+        if aws_access_key_id and aws_secret_access_key:
+            # When we have credentials, check for session token in environment if enabled
+            if self.use_env_token:
+                aws_session_token = self._aws_session_token or os.getenv("AWS_SESSION_TOKEN")
+
+        elif self.aws_access_key_id and self.aws_secret_access_key:
+            aws_access_key_id = self.aws_access_key_id
+            aws_secret_access_key = self.aws_secret_access_key
+            # Check for session token in environment if use_env_token is enabled
+            if self.use_env_token:
+                aws_session_token = self._aws_session_token or os.getenv("AWS_SESSION_TOKEN")
+
+        elif "AWS_ACCESS_KEY_ID" in os.environ and "AWS_SECRET_ACCESS_KEY" in os.environ:
+            aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
+            aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+            # Check for session token in environment if use_env_token is enabled
+            if self.use_env_token:
+                aws_session_token = self._aws_session_token or os.getenv("AWS_SESSION_TOKEN")
+
+        else:
+            s3 = S3(use_env_token=self.use_env_token)
+            creds = s3.aws.session.get_credentials()
+            aws_access_key_id = creds.access_key
+            aws_secret_access_key = creds.secret_key
+            # Extract session token from S3 session credentials if available
+            aws_session_token = creds.token
+
+        return aws_access_key_id, aws_secret_access_key, aws_session_token
 
     def copy_statement(
         self,
@@ -113,31 +279,55 @@ class RedshiftCopyTable(object):
         return sql
 
     def get_creds(self, aws_access_key_id, aws_secret_access_key):
-        if aws_access_key_id and aws_secret_access_key:
-            # When we have credentials, then we don't need to set them again
-            pass
+        """
+        Get credentials string for Redshift COPY command with unified IAM support.
 
+        `Args:`
+            aws_access_key_id: str
+                AWS access key ID (can be None for role-based authentication)
+            aws_secret_access_key: str
+                AWS secret access key (can be None for role-based authentication)
+
+        `Returns:`
+            str
+                Formatted credentials string for Redshift COPY command
+        """
+        # Priority 1: Client-side STS role assumption (NEW)
+        if self.role_arn:
+            sts_creds = self._get_sts_credentials()
+            cred_parts = [
+                f"aws_access_key_id={sts_creds['access_key']}",
+                f"aws_secret_access_key={sts_creds['secret_key']}",
+                f"token={sts_creds['session_token']}",
+            ]
+            credentials_string = ";".join(cred_parts)
+            return f"credentials '{credentials_string}'\n"
+
+        # Priority 2: Redshift service-side role assumption (EXISTING - deprecated)
         elif self.iam_role:
-            # bail early, since the bottom is specifically formatted with creds
+            logger.warning(
+                "Using iam_role for service-side role assumption is deprecated. "
+                "Consider using role_arn for client-side assumption instead."
+            )
             return f"credentials 'aws_iam_role={self.iam_role}'\n"
 
-        elif self.aws_access_key_id and self.aws_secret_access_key:
-            aws_access_key_id = self.aws_access_key_id
-            aws_secret_access_key = self.aws_secret_access_key
-
-        elif "AWS_ACCESS_KEY_ID" in os.environ and "AWS_SECRET_ACCESS_KEY" in os.environ:
-            aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
-            aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
-
+        # Priority 3: Standard credential resolution (EXISTING with session token support)
         else:
-            s3 = S3(use_env_token=self.use_env_token)
-            creds = s3.aws.session.get_credentials()
-            aws_access_key_id = creds.access_key
-            aws_secret_access_key = creds.secret_key
+            aws_access_key_id, aws_secret_access_key, aws_session_token = (
+                self._get_standard_credentials(aws_access_key_id, aws_secret_access_key)
+            )
 
-        return "credentials 'aws_access_key_id={};aws_secret_access_key={}'\n".format(
-            aws_access_key_id, aws_secret_access_key
-        )
+            # Build credentials string with session token if available
+            cred_parts = [
+                f"aws_access_key_id={aws_access_key_id}",
+                f"aws_secret_access_key={aws_secret_access_key}",
+            ]
+
+            if aws_session_token:
+                cred_parts.append(f"token={aws_session_token}")
+
+            credentials_string = ";".join(cred_parts)
+            return f"credentials '{credentials_string}'\n"
 
     def temp_s3_copy(
         self,
